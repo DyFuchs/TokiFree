@@ -10,8 +10,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import dateparser
 
 # Configurações
-BOT_TOKEN = "8504622577:AAFIdt9CI9boPlGbnYwDWvIu2PEH3yjzdLw"
-CHAT_ID = 1378751322
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
 DB_PATH = "reminders.db"
 
 # Inicializa banco SQLite
