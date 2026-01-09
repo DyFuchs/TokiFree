@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
 import pytz
+from dateutil.relativedelta import relativedelta
 
 # Configuração de logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -122,8 +123,8 @@ def update_reminder_time_by_desc(description, new_time):
     return count
 
 def parse_pt_br_date(text, now):
-    """Parser especializado para datas em português do Brasil"""
-    text = text.lower()
+    """Parser robusto para datas em português do Brasil"""
+    text = text.lower().strip()
     
     # Mapeamento de dias da semana (0=segunda, 6=domingo)
     weekdays = {
@@ -132,33 +133,66 @@ def parse_pt_br_date(text, now):
         'quarta': 2, 'quarta-feira': 2, 'quarta feira': 2,
         'quinta': 3, 'quinta-feira': 3, 'quinta feira': 3,
         'sexta': 4, 'sexta-feira': 4, 'sexta feira': 4,
-        'sábado': 5, 'sabado': 5, 'sábado-feira': 5, 'sabado-feira': 5,
+        'sábado': 5, 'sabado': 5,
         'domingo': 6
     }
     
-    # 1. Detecta dias da semana com modificadores
+    # 1. Último domingo do mês
+    if "último domingo do mês" in text or "ultimo domingo do mes" in text:
+        # Último dia do mês atual
+        last_day = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        # Retrocede até encontrar domingo
+        while last_day.weekday() != 6:  # 6 = domingo
+            last_day -= timedelta(days=1)
+        return last_day
+    
+    # 2. Primeiro domingo do mês que vem
+    if "primeiro domingo do mês que vem" in text or "primeiro domingo do mes que vem" in text:
+        # Primeiro dia do próximo mês
+        next_month = (now.replace(day=28) + timedelta(days=4)).replace(day=1)
+        # Avança até encontrar domingo
+        while next_month.weekday() != 6:
+            next_month += timedelta(days=1)
+        return next_month
+    
+    # 3. Dias da semana com modificadores
     for day_name, weekday_num in weekdays.items():
-        # Padrões para "próxima segunda", "segunda que vem", etc.
-        patterns = [
-            rf'pr[oó]xim[ao]?\s+{day_name}',
-            rf'{day_name}\s+que\s+ve[mn]',
-            rf'pr[oó]x[ao]?\s+{day_name}',
-            rf'{day_name}\s+da\s+semana\s+que\s+ve[mn]'
+        # Padrões para identificar o dia da semana
+        day_patterns = [
+            rf'\b{day_name}\b',
+            rf'\b{day_name.replace("-", " ")}\b'
         ]
         
-        for pattern in patterns:
+        for pattern in day_patterns:
             if re.search(pattern, text):
-                # Calcula quantos dias até o próximo dia da semana especificado
-                days_ahead = (weekday_num - now.weekday() + 7) % 7
-                # Se for hoje ou já passou esta semana, vai para a próxima semana
-                if days_ahead <= 0:
+                # Verifica modificadores
+                next_week = False
+                this_week = False
+                
+                if re.search(r'\b(pr[oó]xim[ao]?|que vem|da pr[oó]xim[ao]? semana|da semana que vem)\b', text):
+                    next_week = True
+                elif re.search(r'\b(esta semana|desta semana|nesta semana)\b', text):
+                    this_week = True
+                
+                # Calcula dias até o dia da semana
+                current_weekday = now.weekday()
+                days_ahead = (weekday_num - current_weekday + 7) % 7
+                
+                # Se é hoje e não é "esta semana", vai para próxima semana
+                if days_ahead == 0 and not this_week:
+                    days_ahead = 7
+                
+                # Se é "próxima semana" ou "semana que vem"
+                if next_week:
                     days_ahead += 7
-                # Se tiver "que vem" ou "próxima", adiciona mais 7 dias
-                if re.search(r'que\s+ve[mn]|pr[oó]xim[ao]', text):
+                
+                # Se já passou esta semana e não é "esta semana"
+                if days_ahead < 7 and current_weekday > weekday_num and not this_week:
                     days_ahead += 7
+                
                 return now.date() + timedelta(days=days_ahead)
     
-    # 2. Datas relativas simples
+    # 4. Datas relativas simples
     if "amanhã" in text or "amanha" in text:
         return now.date() + timedelta(days=1)
     if "hoje" in text:
@@ -166,49 +200,26 @@ def parse_pt_br_date(text, now):
     if "depois de amanhã" in text or "depois de amanha" in text:
         return now.date() + timedelta(days=2)
     
-    # 3. Último dia útil do mês
-    if "último dia útil" in text or "ultimo dia util" in text or "ultimo dia útil" in text:
-        # Encontra o último dia do mês atual
-        next_month = now.replace(day=28) + timedelta(days=4)
-        last_day = next_month - timedelta(days=next_month.day)
-        
-        # Se for final de semana, retrocede para sexta-feira
-        while last_day.weekday() >= 5:  # 5=sábado, 6=domingo
+    # 5. Último dia útil do mês
+    if "último dia útil do mês" in text or "ultimo dia util do mes" in text:
+        last_day = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        while last_day.weekday() >= 5:  # Final de semana
             last_day -= timedelta(days=1)
         return last_day
     
-    # 4. Primeiro dia útil do mês
-    if "primeiro dia útil" in text or "primeiro dia util" in text:
-        first_day = now.replace(day=1).date()
-        # Se for final de semana, avança para segunda-feira
-        while first_day.weekday() >= 5:
-            first_day += timedelta(days=1)
-        return first_day
-    
-    # 5. Última sexta-feira do mês
-    if "última sexta-feira do mês" in text or "ultima sexta feira do mes" in text:
-        # Encontra o último dia do mês
-        next_month = now.replace(day=28) + timedelta(days=4)
-        last_day = next_month - timedelta(days=next_month.day)
-        
-        # Retrocede até encontrar a última sexta-feira
-        while last_day.weekday() != 4:  # 4=sexta-feira
-            last_day -= timedelta(days=1)
-        return last_day
-    
-    # 6. Primeira segunda-feira do mês
-    if "primeira segunda-feira do mês" in text or "primeira segunda feira do mes" in text:
-        first_day = now.replace(day=1).date()
-        # Avança até encontrar a primeira segunda-feira
-        while first_day.weekday() != 0:  # 0=segunda-feira
-            first_day += timedelta(days=1)
-        return first_day
+    # 6. Primeiro dia útil do mês que vem
+    if "primeiro dia útil do mês que vem" in text or "primeiro dia util do mes que vem" in text:
+        next_month = (now.replace(day=28) + timedelta(days=4)).replace(day=1)
+        while next_month.weekday() >= 5:
+            next_month += timedelta(days=1)
+        return next_month
     
     return None
 
 def parse_datetime(text):
     """Parser completo para datas em português"""
     now = datetime.now(tz)
+    original_text = text
     text_lower = text.lower()
     
     # Caso especial: "daqui Xmin"
@@ -223,7 +234,7 @@ def parse_datetime(text):
     minute = now.minute
     has_explicit_time = False
     
-    # Padrões de hora: 15h, 15:30, 15h30, às 15h, as 15:30
+    # Padrões de hora
     hour_patterns = [
         r'(\d{1,2})[:h](\d{2})',  # 15:30 ou 15h30
         r'(\d{1,2})\s*[hH]',      # 15h
@@ -231,33 +242,43 @@ def parse_datetime(text):
         r'(\d{1,2})\s*[:h]\s*(\d{2})?\s*(?:h|horas?)?', # variações
     ]
     
+    extracted_hour = None
+    extracted_minute = None
+    
     for pattern in hour_patterns:
         hour_match = re.search(pattern, text_lower)
         if hour_match:
-            hour = int(hour_match.group(1))
-            minute = int(hour_match.group(2)) if len(hour_match.groups()) > 1 and hour_match.group(2) else 0
+            extracted_hour = int(hour_match.group(1))
+            extracted_minute = int(hour_match.group(2)) if hour_match.lastindex > 1 and hour_match.group(2) else 0
             has_explicit_time = True
             
-            # Normaliza hora 24h
-            if hour < 12 and ('pm' in text_lower or 'tarde' in text_lower or 'noite' in text_lower):
-                hour += 12
-            elif hour == 12 and ('am' in text_lower or 'manhã' in text_lower or 'manha' in text_lower):
-                hour = 0
-            
-            # Remove a parte da hora do texto para análise da data
-            text_lower = re.sub(pattern, '', text_lower)
+            # Remove a parte da hora do texto
+            text_lower = re.sub(pattern, '', text_lower, 1)
             text_lower = re.sub(r'\s+', ' ', text_lower).strip()
             break
     
+    # Normaliza hora 24h se encontrou hora explícita
+    if extracted_hour is not None:
+        hour = extracted_hour
+        minute = extracted_minute
+        
+        # Contexto para AM/PM
+        if hour < 12:
+            if 'tarde' in text_lower or 'noite' in text_lower or 'pm' in text_lower:
+                hour += 12
+        elif hour == 12:
+            if 'manhã' in text_lower or 'manha' in text_lower or 'am' in text_lower:
+                hour = 0
+    
     # Remove palavras que não são parte da data
-    text_clean = re.sub(r'\b(?:para|as|às|a|o|aos|daqui|em|no|na)\b', '', text_lower)
+    text_clean = re.sub(r'\b(?:para|as|às|a|o|aos|daqui|em|no|na|de|do|da)\b', '', text_lower)
     text_clean = re.sub(r'\s+', ' ', text_clean).strip()
     
     # Tenta parsear data complexa em português
     target_date = parse_pt_br_date(text_clean, now)
     
     if not target_date:
-        # Fallback para data atual se não encontrar data explícita
+        # Fallback para data atual
         target_date = now.date()
     
     # Combina data e hora
@@ -265,12 +286,12 @@ def parse_datetime(text):
         remind_time = datetime.combine(target_date, datetime.min.time())
         remind_time = tz.localize(remind_time.replace(hour=hour, minute=minute))
         
-        # Se não tinha hora explícita e é hoje, usa o horário atual + 1h como padrão
+        # Se não tinha hora explícita e é hoje, usa horário atual + 1h
         if not has_explicit_time and remind_time.date() == now.date() and remind_time < now:
             remind_time = remind_time.replace(hour=now.hour + 1, minute=0)
         
         # Se é hoje e a hora já passou, agenda para amanhã (só se não tiver data explícita)
-        if remind_time.date() == now.date() and remind_time < now and not re.search(r'\d{1,2}[/-]\d{1,2}', text):
+        if remind_time.date() == now.date() and remind_time < now and not re.search(r'\d{1,2}[/-]\d{1,2}', original_text):
             remind_time += timedelta(days=1)
         
         return remind_time
@@ -294,20 +315,19 @@ def webhook():
             "✅ Formato CORRETO:\n"
             "• agendar \"Dentista\" hoje 15h\n"
             "• agendar \"Reunião\" amanhã 14:30\n"
-            "• agendar \"Remédio\" 09/01/2026 12:05\n"
-            "• agendar \"X\" daqui 5min\n"
-            "• agendar \"Y\" \"segunda que vem\" 9h\n"
-            "• agendar \"Z\" \"último dia útil do mês\" 15h\n\n"
+            "• agendar \"X\" \"segunda-feira que vem\" 15h\n"
+            "• agendar \"Y\" \"último domingo do mês\" 13h\n"
+            "• agendar \"Z\" \"primeiro domingo do mês que vem\" 10h\n\n"
             f"⏰ Fuso horário: {TIMEZONE}\n\n"
             "🔧 Este bot precisa de um serviço externo para funcionar 24h.\n"
             "Acesse: https://cron-job.org e configure:\n"
             f"URL: https://{request.host}/send-reminders\n"
             "Frequência: every minute\n\n"
-            "📋 COMANDOS ADICIONAIS:\n"
-            "/listar - Ver todos os lembretes\n"
-            "/cancelar \"descrição\" ou [ID] - Cancelar lembrete\n"
+            "📋 COMANDOS:\n"
+            "/listar - Ver lembretes\n"
+            "/cancelar \"descrição\" ou [ID]\n"
             "/cancelartodos - Cancelar todos\n"
-            "/remarcar \"descrição\" ou [ID] [nova data]"
+            "/remarcar \"descrição\" [nova data] ou [ID] [nova data]"
         )
         return "OK"
     
@@ -329,10 +349,8 @@ def webhook():
         return "OK"
     
     if text.lower().startswith("/cancelar "):
-        # Extrai o argumento (pode ser ID ou descrição entre aspas)
         arg = text[9:].strip()
         
-        # Tenta interpretar como ID primeiro
         if arg.isdigit():
             rid = int(arg)
             reminders = load_reminders()
@@ -340,21 +358,20 @@ def webhook():
             
             if reminder:
                 delete_reminder(rid)
-                send_message(chat_id, f"✅ Lembrete ID={rid} cancelado com sucesso!\nDescrição: {reminder['desc']}")
+                send_message(chat_id, f"✅ Lembrete ID={rid} cancelado!\nDescrição: {reminder['desc']}")
             else:
                 send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
         else:
-            # Tenta extrair descrição entre aspas
             desc_match = re.search(r'"([^"]+)"', arg)
             if desc_match:
                 desc = desc_match.group(1).strip()
                 count = delete_reminder_by_desc(desc)
                 if count > 0:
-                    send_message(chat_id, f"✅ {count} lembrete(s) com descrição \"{desc}\" cancelado(s)!")
+                    send_message(chat_id, f"✅ {count} lembrete(s) \"{desc}\" cancelado(s)!")
                 else:
-                    send_message(chat_id, f"❌ Nenhum lembrete encontrado com descrição \"{desc}\"")
+                    send_message(chat_id, f"❌ Nenhum lembrete com descrição \"{desc}\"")
             else:
-                send_message(chat_id, "❌ Formato inválido para /cancelar\n\nUse:\n/cancelar \"descrição\"\nou\n/cancelar [ID]")
+                send_message(chat_id, "❌ Formato inválido\nUse:\n/cancelar \"descrição\"\nou\n/cancelar [ID]")
         
         return "OK"
     
@@ -364,18 +381,37 @@ def webhook():
         return "OK"
     
     if text.lower().startswith("/remarcar "):
-        # Formato: /remarcar "descrição" nova_data_hora  ou  /remarcar ID nova_data_hora
-        parts = text[10:].strip().split(maxsplit=1)
-        if len(parts) < 2:
-            send_message(chat_id, "❌ Formato inválido para /remarcar\n\nUse:\n/remarcar \"descrição\" [nova data/hora]\nou\n/remarcar [ID] [nova data/hora]")
+        # Novo formato mais flexível
+        text_clean = text[10:].strip()
+        
+        # Tenta extrair descrição entre aspas no início
+        desc_match = re.match(r'^"([^"]+)"\s+(.+)$', text_clean)
+        if desc_match:
+            desc = desc_match.group(1).strip()
+            new_datetime_str = desc_match.group(2).strip()
+            
+            # Parseia a nova data/hora
+            new_time = parse_datetime(new_datetime_str)
+            if not new_time:
+                send_message(chat_id, f"❌ Não entendi a nova data: '{new_datetime_str}'")
+                return "OK"
+            
+            count = update_reminder_time_by_desc(desc, new_time)
+            if count > 0:
+                send_message(chat_id, 
+                    f"✅ {count} lembrete(s) \"{desc}\" remarcado(s)!\n"
+                    f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
+                )
+            else:
+                send_message(chat_id, f"❌ Nenhum lembrete com descrição \"{desc}\"")
             return "OK"
         
-        identifier = parts[0]
-        new_datetime_str = parts[1]
-        
-        # Tenta interpretar como ID
-        if identifier.isdigit():
-            rid = int(identifier)
+        # Tenta formato ID + data
+        parts = text_clean.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].isdigit():
+            rid = int(parts[0])
+            new_datetime_str = parts[1]
+            
             reminders = load_reminders()
             reminder = next((r for r in reminders if r["id"] == rid), None)
             
@@ -383,10 +419,9 @@ def webhook():
                 send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
                 return "OK"
             
-            # Parseia a nova data/hora
             new_time = parse_datetime(new_datetime_str)
             if not new_time:
-                send_message(chat_id, f"❌ Não consegui entender a nova  '{new_datetime_str}'")
+                send_message(chat_id, f"❌ Não entendi a nova data: '{new_datetime_str}'")
                 return "OK"
             
             update_reminder_time(rid, new_time)
@@ -395,28 +430,17 @@ def webhook():
                 f"Descrição: {reminder['desc']}\n"
                 f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
             )
-        else:
-            # Tenta extrair descrição entre aspas
-            desc_match = re.search(r'"([^"]+)"', identifier)
-            if desc_match:
-                desc = desc_match.group(1).strip()
-                # Parseia a nova data/hora
-                new_time = parse_datetime(new_datetime_str)
-                if not new_time:
-                    send_message(chat_id, f"❌ Não consegui entender a nova data '{new_datetime_str}'")
-                    return "OK"
-                
-                count = update_reminder_time_by_desc(desc, new_time)
-                if count > 0:
-                    send_message(chat_id, 
-                        f"✅ {count} lembrete(s) com descrição \"{desc}\" remarcado(s)!\n"
-                        f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
-                    )
-                else:
-                    send_message(chat_id, f"❌ Nenhum lembrete encontrado com descrição \"{desc}\"")
-            else:
-                send_message(chat_id, "❌ Formato inválido para /remarcar\n\nUse:\n/remarcar \"descrição\" [nova data/hora]\nou\n/remarcar [ID] [nova data/hora]")
+            return "OK"
         
+        send_message(chat_id, 
+            "❌ Formato inválido para /remarcar\n\n"
+            "✅ Formatos corretos:\n"
+            "/remarcar \"descrição\" nova data\n"
+            "/remarcar [ID] nova data\n\n"
+            "Exemplos:\n"
+            "/remarcar \"Dentista\" amanhã 15h\n"
+            "/remarcar 42 \"último domingo do mês\" 10h"
+        )
         return "OK"
     
     if text.lower().startswith("agendar "):
@@ -445,7 +469,7 @@ def webhook():
             clean_input = re.sub(r'toda semana', '', clean_input, flags=re.IGNORECASE)
         
         # Limpeza final
-        clean_input = re.sub(r'\bpara\b|\bdaqui\b', ' ', clean_input, flags=re.IGNORECASE)
+        clean_input = re.sub(r'\bpara\b', ' ', clean_input, flags=re.IGNORECASE)
         clean_input = re.sub(r'\s+', ' ', clean_input).strip()
         
         # Faz parsing
@@ -453,14 +477,13 @@ def webhook():
         
         if not parsed:
             send_message(chat_id, 
-                f"❌ Não consegui entender a data em: '{clean_input}'\n\n"
+                f"❌ Não entendi a data: '{clean_input}'\n\n"
                 "✅ Exemplos válidos:\n"
                 "• hoje 15h\n"
                 "• amanhã 14:30\n"
-                "• 09/01/2026 12:05\n"
-                "• daqui 5min\n"
-                "• \"segunda que vem\" 9h\n"
-                "• \"último dia útil do mês\" 15h"
+                "• \"segunda-feira que vem\" 15h\n"
+                "• \"último domingo do mês\" 13h\n"
+                "• \"primeiro domingo do mês que vem\" 10h"
             )
             return "OK"
         
@@ -497,11 +520,11 @@ def send_reminders_manual():
             
             message = f"🔔 LEMBRETE:\n⏰ {r['desc']}\n📅 {r['time'].strftime('%d/%m/%Y %H:%M')}"
             if r["recurrence"]:
-                message += f"\n🔄 Este lembrete é {r['recurrence']}"
+                message += f"\n🔄 Recorrência: {r['recurrence']}"
             send_message(CHAT_ID, message)
             sent_count += 1
             
-            # Reagenda recorrentes ANTES de deletar o original
+            # Reagenda recorrentes
             if r["recurrence"] == "daily":
                 new_time = r["time"] + timedelta(days=1)
                 save_reminder(r["desc"], new_time, "daily")
@@ -529,10 +552,11 @@ def home():
     return (
         f"Webhook status: {res.json()}<br>"
         f"Fuso horário: {TIMEZONE}<br>"
-        f"URL para cron-job.org: https://{request.host}/send-reminders"
+        f"URL para cron-job.org: https://{request.host}/send-reminders<br>"
+        "<br>✅ Bot está funcionando corretamente!"
     )
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", "8000"))  # Garante string para int()
     app.run(host="0.0.0.0", port=port)
