@@ -1,52 +1,17 @@
 import os
 import sqlite3
-import asyncio
+import json
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask, request
 import dateparser
+import requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = "/webhook"
 CHAT_ID = int(os.getenv("CHAT_ID"))
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-app_flask = Flask(__name__)
+app = Flask(__name__)
 
-# Inicializa e prepara o Application globalmente
-async def init_application():
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Use: agendar [descrição] [data/hora]")
-    
-    async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text.strip()
-        if not text.lower().startswith("agendar "):
-            return
-        user_input = text[8:].strip()
-        desc = user_input
-        recurrence = None
-        if "todo dia" in user_input.lower():
-            recurrence = "daily"
-            desc = user_input.lower().replace("todo dia", "").strip()
-        elif "toda semana" in user_input.lower():
-            recurrence = "weekly"
-            desc = user_input.lower().replace("toda semana", "").strip()
-        parsed = dateparser.parse(desc, settings={'RELATIVE_BASE': datetime.now(), 'PREFER_DATES_FROM': 'future'})
-        if not parsed:
-            await update.message.reply_text("Não entendi a data.")
-            return
-        save_reminder(desc, parsed, recurrence)
-        rec_msg = f" (🔁 {recurrence})" if recurrence else ""
-        await update.message.reply_text(f"Lembrete salvo!{rec_msg}\n⏰ {desc}\n📅 {parsed.strftime('%d/%m %H:%M')}")
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    await application.initialize()
-    return application
-
-# Funções do banco (fora da função assíncrona)
 def init_db():
     conn = sqlite3.connect("reminders.db")
     conn.execute("""
@@ -59,6 +24,9 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+def send_message(chat_id, text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 def save_reminder(desc, remind_time, recurrence=None):
     conn = sqlite3.connect("reminders.db")
@@ -81,22 +49,50 @@ def delete_reminder(rid):
     conn.commit()
     conn.close()
 
-# Inicializa o Application globalmente
-application = asyncio.run(init_application())
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if "message" not in data:
+        return "OK"
+    
+    message = data["message"]
+    chat_id = message["from"]["id"]
+    text = message.get("text", "").strip()
+    
+    if text == "/start":
+        send_message(chat_id, "Use: agendar [descrição] [data/hora]\nEx: agendar Dentista amanhã 15h")
+        return "OK"
+    
+    if text.lower().startswith("agendar "):
+        user_input = text[8:].strip()
+        desc = user_input
+        recurrence = None
+        
+        if "todo dia" in user_input.lower():
+            recurrence = "daily"
+            desc = user_input.lower().replace("todo dia", "").strip()
+        elif "toda semana" in user_input.lower():
+            recurrence = "weekly"
+            desc = user_input.lower().replace("toda semana", "").strip()
+        
+        parsed = dateparser.parse(desc, settings={'RELATIVE_BASE': datetime.now(), 'PREFER_DATES_FROM': 'future'})
+        if not parsed:
+            send_message(chat_id, "Não entendi a data. Tente: 'agendar X amanhã 15h'")
+            return "OK"
+        
+        save_reminder(desc, parsed, recurrence)
+        rec_msg = f" (🔁 {recurrence})" if recurrence else ""
+        send_message(chat_id, f"Lembrete salvo!{rec_msg}\n⏰ {desc}\n📅 {parsed.strftime('%d/%m %H:%M')}")
+        return "OK"
+    
+    return "OK"
 
-@app_flask.route(WEBHOOK_PATH, methods=["POST"])
-def telegram_webhook():
-    update = Update.de_json(request.get_json(), application.bot)
-    asyncio.run(application.process_update(update))
-    return jsonify({"ok": True})
-
-@app_flask.route("/send-reminders", methods=["GET"])
+@app.route("/send-reminders", methods=["GET"])
 def send_reminders_manual():
-    bot = Bot(token=BOT_TOKEN)
     now = datetime.now()
     for r in load_reminders():
         if r["time"] <= now:
-            bot.send_message(chat_id=CHAT_ID, text=f"🔔 Lembrete: {r['desc']}")
+            send_message(CHAT_ID, f"🔔 Lembrete: {r['desc']}")
             delete_reminder(r["id"])
             if r["recurrence"] == "daily":
                 save_reminder(r["desc"], r["time"] + timedelta(days=1), "daily")
@@ -104,14 +100,12 @@ def send_reminders_manual():
                 save_reminder(r["desc"], r["time"] + timedelta(weeks=1), "weekly")
     return "OK"
 
-@app_flask.route("/")
+@app.route("/")
 def home():
-    import requests
-    webhook_url = f"https://{request.host}{WEBHOOK_PATH}"
-    res = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook", json={"url": webhook_url})
+    webhook_url = f"https://{request.host}/webhook"
+    res = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
     return f"Webhook status: {res.json()}"
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.getenv("PORT", 8000))
-    app_flask.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
