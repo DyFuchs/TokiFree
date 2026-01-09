@@ -3,7 +3,6 @@ import sqlite3
 import re
 from datetime import datetime, timedelta
 from flask import Flask, request
-import dateparser
 import requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -49,6 +48,53 @@ def delete_reminder(rid):
     conn.commit()
     conn.close()
 
+def parse_datetime_fallback(text):
+    """Parser manual para formatos comuns em português"""
+    now = datetime.now()
+    text = text.lower()
+    
+    # Detecta hora no formato HH:MM ou HHh
+    hour_match = re.search(r'(\d{1,2})[:h](\d{2})?', text)
+    hour = minute = 0
+    if hour_match:
+        hour = int(hour_match.group(1))
+        minute = int(hour_match.group(2)) if hour_match.group(2) else 0
+        # Remove a hora do texto para facilitar detecção de data
+        text = re.sub(r'\d{1,2}[:h]\d{0,2}', '', text)
+    
+    # Detecta datas relativas
+    if "amanhã" in text:
+        target_date = now.date() + timedelta(days=1)
+    elif "hoje" in text:
+        target_date = now.date()
+    else:
+        # Tenta detectar data no formato DD/MM
+        date_match = re.search(r'(\d{1,2})[/-](\d{1,2})', text)
+        if date_match:
+            day = int(date_match.group(1))
+            month = int(date_match.group(2))
+            year = now.year
+            if month < now.month or (month == now.month and day < now.day):
+                year += 1
+            try:
+                target_date = datetime(year, month, day).date()
+            except:
+                target_date = now.date() + timedelta(days=1)
+        else:
+            # Default para amanhã se não encontrar data
+            target_date = now.date() + timedelta(days=1)
+    
+    # Combina data e hora
+    try:
+        remind_time = datetime.combine(target_date, datetime.min.time())
+        remind_time = remind_time.replace(hour=hour, minute=minute)
+        # Se a hora já passou hoje, agenda para amanhã
+        if remind_time < now:
+            remind_time += timedelta(days=1)
+        return remind_time
+    except:
+        return None
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -61,7 +107,7 @@ def webhook():
     
     if text == "/start":
         send_message(chat_id, 
-            "✅ Exemplos de uso:\n"
+            "✅ Funciona com estes formatos:\n"
             "• agendar Dentista amanhã 15h\n"
             "• agendar Reunião hoje 14:30\n"
             "• agendar Remédio todo dia 8h"
@@ -80,55 +126,38 @@ def webhook():
             recurrence = "weekly"
             user_input = re.sub(r'toda semana', '', user_input, flags=re.IGNORECASE)
         
-        # Normaliza hora: "15h" → "15:00" (sem espaços)
-        user_input = re.sub(r'(\d{1,2})h', r'\1:00', user_input)
+        # Limpeza básica
+        user_input_clean = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
+        user_input_clean = re.sub(r'\s+', ' ', user_input_clean).strip()
         
-        # Remove apenas "para"
-        user_input = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
-        user_input = re.sub(r'\s+', ' ', user_input).strip()
-        
-        if not user_input:
-            send_message(chat_id, "❌ Formato inválido. Use: 'agendar [descrição] [data/hora]'")
-            return "OK"
-        
-        # Tenta parsear com suporte a PT
-        try:
-            parsed = dateparser.parse(
-                user_input,
-                languages=['pt'],
-                settings={
-                    'RELATIVE_BASE': datetime.now(),
-                    'PREFER_DATES_FROM': 'future',
-                    'TIMEZONE': 'America/Sao_Paulo'
-                }
-            )
-        except:
-            parsed = None
+        # Primeiro tenta com parser manual (mais confiável para este caso)
+        parsed = parse_datetime_fallback(user_input_clean)
         
         if not parsed:
             send_message(chat_id, 
-                f"❌ Não entendi: '{user_input}'\n"
-                "✅ Tente: 'agendar X amanhã 15h'"
+                f"❌ Não entendi a data em: '{user_input}'\n"
+                "✅ Use exatamente: 'agendar [descrição] amanhã 15h'"
             )
             return "OK"
         
-        # Extrai descrição removendo partes de data/hora
+        # Extrai descrição removendo palavras-chave de data/hora
         desc = user_input
-        time_patterns = [
-            r'\d{1,2}:\d{2}',
-            r'\d{1,2}/\d{1,2}/\d{4}',
-            r'\d{1,2}/\d{1,2}',
-            r'amanhã|hoje|segunda|terça|quarta|quinta|sexta|sábado|domingo'
-        ]
-        for pattern in time_patterns:
-            desc = re.sub(pattern, '', desc, flags=re.IGNORECASE)
+        for kw in ["amanhã", "hoje", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo", 
+                  "todo dia", "diariamente", "toda semana", "para", "às", "as", "h"]:
+            desc = re.sub(rf'\b{kw}\b', '', desc, flags=re.IGNORECASE)
+        # Remove horários e datas
+        desc = re.sub(r'\d{1,2}[:h]\d{0,2}', '', desc)
+        desc = re.sub(r'\d{1,2}[/-]\d{1,2}', '', desc)
         desc = re.sub(r'\s+', ' ', desc).strip()
+        
+        if not desc:
+            desc = "Lembrete"
         
         save_reminder(desc, parsed, recurrence)
         rec_msg = f" (🔁 {recurrence})" if recurrence else ""
         send_message(chat_id, 
             f"✅ Lembrete salvo!{rec_msg}\n"
-            f"⏰ {desc or 'Lembrete'}\n"
+            f"⏰ {desc}\n"
             f"📅 {parsed.strftime('%d/%m/%Y %H:%M')}"
         )
         return "OK"
