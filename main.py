@@ -2,11 +2,11 @@ import os
 import sqlite3
 import re
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from flask import Flask, request
 import requests
 import pytz
-from dateutil.relativedelta import relativedelta, MO, TU, WE, TH, FR, SA, SU
+import parsedatetime as pdt
 
 # Configuração de logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,6 +20,8 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
 tz = pytz.timezone(TIMEZONE)
+# Parser de datas em linguagem natural (suporta português)
+cal = pdt.Calendar(pdt.Constants(localeID="pt_BR"))
 
 def init_db():
     conn = sqlite3.connect("reminders.db")
@@ -122,60 +124,41 @@ def update_reminder_time_by_desc(description, new_time):
     logger.info(f"{count} lembrete(s) com descrição '{description}' atualizado(s) para {new_time}")
     return count
 
-def calculate_complex_date(text, now):
-    """Calcula datas complexas como 'próxima segunda', 'último domingo do mês'"""
-    text_lower = text.lower()
-    current_weekday = now.weekday()  # 0=segunda, 6=domingo
+def parse_natural_language_date(text):
+    """Parser genérico para datas em linguagem natural (português)"""
+    now = datetime.now(tz)
     
-    # Próxima segunda-feira
-    if "próxima segunda" in text_lower or "proxima segunda" in text_lower:
-        days_ahead = (7 - current_weekday) % 7
-        if days_ahead == 0:  # Hoje é segunda
-            days_ahead = 7
-        return now.date() + timedelta(days=days_ahead)
+    # Remove aspas e normaliza
+    text = text.replace('"', '').strip()
     
-    # Quarta-feira da semana que vem
-    if "quarta-feira da semana que vem" in text_lower or "quarta da semana que vem" in text_lower:
-        days_ahead = (2 - current_weekday) % 7  # 2 = quarta-feira
-        if days_ahead <= 0:  # Já passou esta semana
-            days_ahead += 7
-        return now.date() + timedelta(days=days_ahead + 7)
-    
-    # Último domingo do mês que vem
-    if "último domingo do mês que vem" in text_lower or "ultimo domingo do mes que vem" in text_lower:
-        # Primeiro, encontra o primeiro dia do próximo mês
-        next_month = now.replace(day=28) + timedelta(days=4)  # Avança para o próximo mês
-        first_day_next_month = next_month.replace(day=1)
+    # Parse com parsedatetime (suporta português)
+    try:
+        # parsedatetime espera timestamp em segundos
+        now_ts = now.timestamp()
+        result = cal.parse(text, now_ts)
         
-        # Encontra o último dia do próximo mês
-        last_day_next_month = (first_day_next_month + relativedelta(months=1)) - timedelta(days=1)
-        
-        # Encontra o último domingo
-        last_sunday = last_day_next_month
-        while last_sunday.weekday() != 6:  # 6 = domingo
-            last_sunday -= timedelta(days=1)
-        
-        return last_sunday
+        # Resultado: (struct_time, status)
+        if result[1] > 0:  # status > 0 = parsing bem-sucedido
+            parsed_time = datetime(*result[0][:6])
+            # Localiza no fuso horário
+            if parsed_time.tzinfo is None:
+                parsed_time = tz.localize(parsed_time)
+            return parsed_time
+    except Exception as e:
+        logger.error(f"Erro no parsedatetime: {str(e)}")
     
-    # Próxima sexta-feira
-    if "próxima sexta" in text_lower or "proxima sexta" in text_lower:
-        days_ahead = (4 - current_weekday) % 7  # 4 = sexta-feira
-        if days_ahead == 0:  # Hoje é sexta
-            days_ahead = 7
-        return now.date() + timedelta(days=days_ahead)
+    # Fallback para datas relativas simples
+    if "amanhã" in text.lower():
+        tomorrow = now.date() + timedelta(days=1)
+        return tz.localize(datetime.combine(tomorrow, datetime.min.time()))
     
-    # Primeiro dia do próximo mês
-    if "primeiro dia do próximo mês" in text_lower or "primeiro dia do proximo mes" in text_lower:
-        return (now.replace(day=1) + relativedelta(months=1)).date()
-    
-    # Último dia do mês atual
-    if "último dia do mês" in text_lower or "ultimo dia do mes" in text_lower:
-        return (now.replace(day=1) + relativedelta(months=1) - timedelta(days=1)).date()
+    if "hoje" in text.lower():
+        return tz.localize(datetime.combine(now.date(), datetime.min.time()))
     
     return None
 
 def parse_datetime(text):
-    """Parser robusto com suporte a datas complexas"""
+    """Parser completo que combina hora explícita com data em linguagem natural"""
     now = datetime.now(tz)
     text_lower = text.lower()
     
@@ -186,77 +169,50 @@ def parse_datetime(text):
             minutes = int(min_match.group(1))
             return now + timedelta(minutes=minutes)
     
-    # Caso especial: datas complexas
-    complex_date = calculate_complex_date(text_lower, now)
-    if complex_date:
-        # Usa a hora atual se não especificada
-        hour = now.hour
-        minute = now.minute
-        
-        hour_match = re.search(r'(\d{1,2})[:h](\d{2})?', text_lower)
-        if hour_match:
-            hour = int(hour_match.group(1))
-            minute = int(hour_match.group(2)) if hour_match.group(2) else 0
-            if hour < 12 and ('pm' in text_lower or 'tarde' in text_lower or 'noite' in text_lower):
-                hour += 12
-            elif hour == 12 and ('am' in text_lower or 'manhã' in text_lower):
-                hour = 0
-        
-        try:
-            remind_time = datetime.combine(complex_date, datetime.min.time())
-            remind_time = tz.localize(remind_time.replace(hour=hour, minute=minute))
-            return remind_time
-        except Exception as e:
-            logger.error(f"Erro ao combinar data complexa: {str(e)}")
-    
-    # Detecta hora
+    # Primeiro, tenta extrair hora explícita
     hour = now.hour
     minute = now.minute
+    has_explicit_time = False
+    
     hour_match = re.search(r'(\d{1,2})[:h](\d{2})?', text_lower)
     if hour_match:
         hour = int(hour_match.group(1))
         minute = int(hour_match.group(2)) if hour_match.group(2) else 0
+        has_explicit_time = True
+        
+        # Normaliza hora 24h
         if hour < 12 and ('pm' in text_lower or 'tarde' in text_lower or 'noite' in text_lower):
             hour += 12
         elif hour == 12 and ('am' in text_lower or 'manhã' in text_lower):
             hour = 0
     
-    # Detecta data
-    target_date = now.date()
-    is_relative = False
+    # Remove a parte de hora do texto para parsing da data
+    clean_text = re.sub(r'\d{1,2}[:h]\d{0,2}', '', text_lower)
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     
-    # Data explícita
-    date_match = re.search(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', text_lower)
-    if date_match:
-        day = int(date_match.group(1))
-        month = int(date_match.group(2))
-        year = int(date_match.group(3)) if date_match.group(3) else now.year
-        try:
-            target_date = datetime(year, month, day).date()
-        except ValueError:
-            pass
+    # Parse da data em linguagem natural
+    parsed_date = parse_natural_language_date(clean_text)
     
-    # Datas relativas
-    if "amanhã" in text_lower:
-        target_date = now.date() + timedelta(days=1)
-        is_relative = True
-    elif "hoje" in text_lower:
-        target_date = now.date()
-        is_relative = True
+    if not parsed_date:
+        # Fallback para data atual se não encontrar data explícita
+        parsed_date = tz.localize(datetime.combine(now.date(), datetime.min.time()))
     
     # Combina data e hora
     try:
-        remind_time = datetime.combine(target_date, datetime.min.time())
-        remind_time = tz.localize(remind_time.replace(hour=hour, minute=minute))
+        result = parsed_date.replace(hour=hour, minute=minute)
         
-        # Só ajusta se for relativo e horário já passou
-        if is_relative and remind_time < now:
-            remind_time += timedelta(days=1)
-            
-        return remind_time
+        # Se não tinha hora explícita e é hoje, usa o horário atual
+        if not has_explicit_time and result.date() == now.date() and result < now:
+            result = result.replace(hour=now.hour, minute=now.minute)
+        
+        # Se é hoje e a hora já passou, agenda para amanhã (só se não tiver data explícita)
+        if result.date() == now.date() and result < now and "hoje" not in text_lower and not re.search(r'\d{1,2}[/-]\d{1,2}', text):
+            result += timedelta(days=1)
+        
+        return result
     except Exception as e:
-        logger.error(f"Erro no parse_datetime: {str(e)}")
-        return None
+        logger.error(f"Erro ao combinar data e hora: {str(e)}")
+        return now + timedelta(minutes=5)  # Fallback seguro
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -276,7 +232,9 @@ def webhook():
             "• agendar \"Reunião\" amanhã 14:30\n"
             "• agendar \"Remédio\" 09/01/2026 12:05\n"
             "• agendar \"X\" daqui 5min\n"
-            "• agendar \"Y\" \"próxima segunda-feira\" 9h\n\n"
+            "• agendar \"Y\" \"próxima segunda-feira\" 9h\n"
+            "• agendar \"Z\" \"terça-feira da semana que vem\" 10h\n"
+            "• agendar \"Aniversário\" \"último domingo do mês\" 15h\n\n"
             f"⏰ Fuso horário: {TIMEZONE}\n\n"
             "🔧 Este bot precisa de um serviço externo para funcionar 24h.\n"
             "Acesse: https://cron-job.org e configure:\n"
@@ -365,14 +323,14 @@ def webhook():
             # Parseia a nova data/hora
             new_time = parse_datetime(new_datetime_str)
             if not new_time:
-                send_message(chat_id, f"❌ Não consegui entender a nova data: '{new_datetime_str}'")
+                send_message(chat_id, f"❌ Não consegui entender a nova  '{new_datetime_str}'")
                 return "OK"
             
             update_reminder_time(rid, new_time)
             send_message(chat_id, 
                 f"✅ Lembrete ID={rid} remarcado!\n"
                 f"Descrição: {reminder['desc']}\n"
-                f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
+                f"Nova  {new_time.strftime('%d/%m/%Y %H:%M')}"
             )
         else:
             # Tenta extrair descrição entre aspas
@@ -382,14 +340,14 @@ def webhook():
                 # Parseia a nova data/hora
                 new_time = parse_datetime(new_datetime_str)
                 if not new_time:
-                    send_message(chat_id, f"❌ Não consegui entender a nova data: '{new_datetime_str}'")
+                    send_message(chat_id, f"❌ Não consegui entender a nova  '{new_datetime_str}'")
                     return "OK"
                 
                 count = update_reminder_time_by_desc(desc, new_time)
                 if count > 0:
                     send_message(chat_id, 
                         f"✅ {count} lembrete(s) com descrição \"{desc}\" remarcado(s)!\n"
-                        f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
+                        f"Nova  {new_time.strftime('%d/%m/%Y %H:%M')}"
                     )
                 else:
                     send_message(chat_id, f"❌ Nenhum lembrete encontrado com descrição \"{desc}\"")
@@ -439,7 +397,8 @@ def webhook():
                 "• 09/01/2026 12:05\n"
                 "• daqui 5min\n"
                 "• \"próxima segunda-feira\" 9h\n"
-                "• \"último domingo do mês que vem\" 10h"
+                "• \"terça-feira da semana que vem\" 10h\n"
+                "• \"último domingo do mês\" 15h"
             )
             return "OK"
         
