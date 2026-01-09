@@ -80,10 +80,11 @@ def webhook():
             recurrence = "weekly"
             user_input = re.sub(r'toda semana', '', user_input, flags=re.IGNORECASE)
         
-        # Normaliza formato de hora
+        # Normaliza hora: "15h" → "15:00" (sem espaços)
         user_input = re.sub(r'(\d{1,2})h', r'\1:00', user_input)
-        # Remove palavras-chave problemáticas
-        user_input = re.sub(r'\bpara\b|\bÀ?s?\b', ' ', user_input, flags=re.IGNORECASE)
+        
+        # Remove apenas "para"
+        user_input = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
         user_input = re.sub(r'\s+', ' ', user_input).strip()
         
         if not user_input:
@@ -111,11 +112,12 @@ def webhook():
             )
             return "OK"
         
-        # Extrai descrição removendo partes reconhecidas como data/hora
+        # Extrai descrição removendo partes de data/hora
         desc = user_input
         time_patterns = [
-            r'\d{1,2}:\d{2}',  # Horas
-            r'\d{1,2}/\d{1,2}',  # Datas curtas
+            r'\d{1,2}:\d{2}',
+            r'\d{1,2}/\d{1,2}/\d{4}',
+            r'\d{1,2}/\d{1,2}',
             r'amanhã|hoje|segunda|terça|quarta|quinta|sexta|sábado|domingo'
         ]
         for pattern in time_patterns:
