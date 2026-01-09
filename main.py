@@ -3,7 +3,7 @@ import sqlite3
 import re
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import requests
 import pytz
 
@@ -278,8 +278,259 @@ def parse_datetime(text):
         logger.error(f"Erro ao combinar data e hora: {str(e)}")
         return now + timedelta(minutes=5)  # Fallback seguro
 
-# ... (todos os outros endpoints permanecem IGUAIS, incluindo /webhook, /send-reminders, etc.)
-# Mantenha exatamente o mesmo código a partir de @app.route("/webhook", methods=["POST"]) até o final do arquivo
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if not data or "message" not in data or "text" not in data["message"]:
+        return "OK"
+    
+    message = data["message"]
+    chat_id = message["from"]["id"]
+    text = message.get("text", "").strip()
+    logger.info(f"Recebida mensagem de {chat_id}: {text}")
+    
+    if text == "/start":
+        send_message(chat_id, 
+            "✅ Formato CORRETO:\n"
+            "• agendar \"Dentista\" hoje 15h\n"
+            "• agendar \"Reunião\" amanhã 14:30\n"
+            "• agendar \"Remédio\" 09/01/2026 12:05\n"
+            "• agendar \"X\" daqui 5min\n"
+            "• agendar \"Y\" \"segunda que vem\" 9h\n"
+            "• agendar \"Z\" \"último dia útil do mês\" 15h\n\n"
+            f"⏰ Fuso horário: {TIMEZONE}\n\n"
+            "🔧 Este bot precisa de um serviço externo para funcionar 24h.\n"
+            "Acesse: https://cron-job.org e configure:\n"
+            f"URL: https://{request.host}/send-reminders\n"
+            "Frequência: every minute\n\n"
+            "📋 COMANDOS ADICIONAIS:\n"
+            "/listar - Ver todos os lembretes\n"
+            "/cancelar \"descrição\" ou [ID] - Cancelar lembrete\n"
+            "/cancelartodos - Cancelar todos\n"
+            "/remarcar \"descrição\" ou [ID] [nova data]"
+        )
+        return "OK"
+    
+    if text.lower() == "/listar":
+        reminders = load_reminders()
+        now = datetime.now(tz)
+        
+        if not reminders:
+            send_message(chat_id, "📭 Nenhum lembrete agendado.")
+            return "OK"
+        
+        message = "📋 LEMBRETES AGENDADOS:\n\n"
+        for r in reminders:
+            status = "✅ ATIVO" if r["time"] > now else "⏳ PENDENTE"
+            message += f"ID: {r['id']}\nDescrição: {r['desc']}\nData: {r['time'].strftime('%d/%m/%Y %H:%M')}\nStatus: {status}\nRecorrência: {r['recurrence'] or 'Nenhuma'}\n\n"
+        
+        message += f"\n⏰ Horário atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M')}"
+        send_message(chat_id, message)
+        return "OK"
+    
+    if text.lower().startswith("/cancelar "):
+        # Extrai o argumento (pode ser ID ou descrição entre aspas)
+        arg = text[9:].strip()
+        
+        # Tenta interpretar como ID primeiro
+        if arg.isdigit():
+            rid = int(arg)
+            reminders = load_reminders()
+            reminder = next((r for r in reminders if r["id"] == rid), None)
+            
+            if reminder:
+                delete_reminder(rid)
+                send_message(chat_id, f"✅ Lembrete ID={rid} cancelado com sucesso!\nDescrição: {reminder['desc']}")
+            else:
+                send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
+        else:
+            # Tenta extrair descrição entre aspas
+            desc_match = re.search(r'"([^"]+)"', arg)
+            if desc_match:
+                desc = desc_match.group(1).strip()
+                count = delete_reminder_by_desc(desc)
+                if count > 0:
+                    send_message(chat_id, f"✅ {count} lembrete(s) com descrição \"{desc}\" cancelado(s)!")
+                else:
+                    send_message(chat_id, f"❌ Nenhum lembrete encontrado com descrição \"{desc}\"")
+            else:
+                send_message(chat_id, "❌ Formato inválido para /cancelar\n\nUse:\n/cancelar \"descrição\"\nou\n/cancelar [ID]")
+        
+        return "OK"
+    
+    if text.lower() == "/cancelartodos":
+        count = delete_all_reminders()
+        send_message(chat_id, f"✅ Todos os {count} lembretes foram cancelados!")
+        return "OK"
+    
+    if text.lower().startswith("/remarcar "):
+        # Formato: /remarcar "descrição" nova_data_hora  ou  /remarcar ID nova_data_hora
+        parts = text[10:].strip().split(maxsplit=1)
+        if len(parts) < 2:
+            send_message(chat_id, "❌ Formato inválido para /remarcar\n\nUse:\n/remarcar \"descrição\" [nova data/hora]\nou\n/remarcar [ID] [nova data/hora]")
+            return "OK"
+        
+        identifier = parts[0]
+        new_datetime_str = parts[1]
+        
+        # Tenta interpretar como ID
+        if identifier.isdigit():
+            rid = int(identifier)
+            reminders = load_reminders()
+            reminder = next((r for r in reminders if r["id"] == rid), None)
+            
+            if not reminder:
+                send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
+                return "OK"
+            
+            # Parseia a nova data/hora
+            new_time = parse_datetime(new_datetime_str)
+            if not new_time:
+                send_message(chat_id, f"❌ Não consegui entender a nova  '{new_datetime_str}'")
+                return "OK"
+            
+            update_reminder_time(rid, new_time)
+            send_message(chat_id, 
+                f"✅ Lembrete ID={rid} remarcado!\n"
+                f"Descrição: {reminder['desc']}\n"
+                f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
+            )
+        else:
+            # Tenta extrair descrição entre aspas
+            desc_match = re.search(r'"([^"]+)"', identifier)
+            if desc_match:
+                desc = desc_match.group(1).strip()
+                # Parseia a nova data/hora
+                new_time = parse_datetime(new_datetime_str)
+                if not new_time:
+                    send_message(chat_id, f"❌ Não consegui entender a nova data '{new_datetime_str}'")
+                    return "OK"
+                
+                count = update_reminder_time_by_desc(desc, new_time)
+                if count > 0:
+                    send_message(chat_id, 
+                        f"✅ {count} lembrete(s) com descrição \"{desc}\" remarcado(s)!\n"
+                        f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
+                    )
+                else:
+                    send_message(chat_id, f"❌ Nenhum lembrete encontrado com descrição \"{desc}\"")
+            else:
+                send_message(chat_id, "❌ Formato inválido para /remarcar\n\nUse:\n/remarcar \"descrição\" [nova data/hora]\nou\n/remarcar [ID] [nova data/hora]")
+        
+        return "OK"
+    
+    if text.lower().startswith("agendar "):
+        full_input = text[8:].strip()
+        
+        # Extrai descrição entre aspas
+        desc_match = re.search(r'"([^"]+)"', full_input)
+        if desc_match:
+            desc = desc_match.group(1).strip()
+            clean_input = full_input.replace(f'"{desc}"', '').strip()
+        else:
+            send_message(chat_id, 
+                "❌ ERRO: Descrição deve estar entre aspas!\n\n"
+                "✅ Formato correto:\n"
+                "agendar \"Sua descrição\" hoje 15h"
+            )
+            return "OK"
+        
+        # Detecta recorrência
+        recurrence = None
+        if "todo dia" in clean_input.lower() or "diariamente" in clean_input.lower():
+            recurrence = "daily"
+            clean_input = re.sub(r'todo dia|diariamente', '', clean_input, flags=re.IGNORECASE)
+        elif "toda semana" in clean_input.lower():
+            recurrence = "weekly"
+            clean_input = re.sub(r'toda semana', '', clean_input, flags=re.IGNORECASE)
+        
+        # Limpeza final
+        clean_input = re.sub(r'\bpara\b|\bdaqui\b', ' ', clean_input, flags=re.IGNORECASE)
+        clean_input = re.sub(r'\s+', ' ', clean_input).strip()
+        
+        # Faz parsing
+        parsed = parse_datetime(clean_input)
+        
+        if not parsed:
+            send_message(chat_id, 
+                f"❌ Não consegui entender a data em: '{clean_input}'\n\n"
+                "✅ Exemplos válidos:\n"
+                "• hoje 15h\n"
+                "• amanhã 14:30\n"
+                "• 09/01/2026 12:05\n"
+                "• daqui 5min\n"
+                "• \"segunda que vem\" 9h\n"
+                "• \"último dia útil do mês\" 15h"
+            )
+            return "OK"
+        
+        # Salva no banco
+        rid = save_reminder(desc, parsed, recurrence)
+        
+        rec_msg = f" (🔁 {recurrence})" if recurrence else ""
+        response = (
+            f"✅ LEMBRETE SALVO (ID={rid})!{rec_msg}\n"
+            f"⏰ {desc}\n"
+            f"📅 {parsed.strftime('%d/%m/%Y %H:%M')}\n"
+            f"🕒 Fuso: {TIMEZONE}"
+        )
+        send_message(chat_id, response)
+        return "OK"
+    
+    return "OK"
+
+@app.route("/send-reminders", methods=["GET"])
+def send_reminders_manual():
+    logger.info("=== INICIANDO VERIFICAÇÃO DE LEMBRETES ===")
+    now = datetime.now(tz)
+    logger.info(f"Horário atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M:%S')}")
+    
+    reminders = load_reminders()
+    logger.info(f"Total de lembretes no banco: {len(reminders)}")
+    
+    sent_count = 0
+    for r in reminders:
+        logger.info(f"Verificando lembrete ID={r['id']}: {r['desc']} | Agendado para: {r['time']} | Agora: {now}")
+        
+        if r["time"] <= now:
+            logger.info(f"🕗 Lembrete ID={r['id']} está na hora! Enviando...")
+            
+            message = f"🔔 LEMBRETE:\n⏰ {r['desc']}\n📅 {r['time'].strftime('%d/%m/%Y %H:%M')}"
+            if r["recurrence"]:
+                message += f"\n🔄 Este lembrete é {r['recurrence']}"
+            send_message(CHAT_ID, message)
+            sent_count += 1
+            
+            # Reagenda recorrentes ANTES de deletar o original
+            if r["recurrence"] == "daily":
+                new_time = r["time"] + timedelta(days=1)
+                save_reminder(r["desc"], new_time, "daily")
+                logger.info(f"↻ Lembrete diário reagendado para: {new_time}")
+            elif r["recurrence"] == "weekly":
+                new_time = r["time"] + timedelta(weeks=1)
+                save_reminder(r["desc"], new_time, "weekly")
+                logger.info(f"↻ Lembrete semanal reagendado para: {new_time}")
+            
+            # Deleta o lembrete original
+            delete_reminder(r["id"])
+    
+    logger.info(f"✅ Verificação concluída. {sent_count} lembretes enviados.")
+    return f"OK - {sent_count} lembretes processados"
+
+@app.route("/debug-time", methods=["GET"])
+def debug_time():
+    now = datetime.now(tz)
+    return f"Hora atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M:%S')}"
+
+@app.route("/")
+def home():
+    webhook_url = f"https://{request.host}/webhook"
+    res = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
+    return (
+        f"Webhook status: {res.json()}<br>"
+        f"Fuso horário: {TIMEZONE}<br>"
+        f"URL para cron-job.org: https://{request.host}/send-reminders"
+    )
 
 if __name__ == "__main__":
     init_db()
