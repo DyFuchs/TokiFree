@@ -1,6 +1,6 @@
 import os
 import sqlite3
-import json
+import re
 from datetime import datetime, timedelta
 from flask import Flask, request
 import dateparser
@@ -31,7 +31,7 @@ def send_message(chat_id, text):
 def save_reminder(desc, remind_time, recurrence=None):
     conn = sqlite3.connect("reminders.db")
     conn.execute("INSERT INTO reminders (description, remind_time, recurrence) VALUES (?, ?, ?)",
-                 (desc, remind_time.isoformat(), recurrence))
+                 (desc.strip() or "Lembrete", remind_time.isoformat(), recurrence))
     conn.commit()
     conn.close()
 
@@ -52,7 +52,7 @@ def delete_reminder(rid):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    if "message" not in data:
+    if not data or "message" not in data or "text" not in data["message"]:
         return "OK"
     
     message = data["message"]
@@ -60,29 +60,75 @@ def webhook():
     text = message.get("text", "").strip()
     
     if text == "/start":
-        send_message(chat_id, "Use: agendar [descrição] [data/hora]\nEx: agendar Dentista amanhã 15h")
+        send_message(chat_id, 
+            "✅ Exemplos de uso:\n"
+            "• agendar Dentista amanhã 15h\n"
+            "• agendar Reunião hoje 14:30\n"
+            "• agendar Remédio todo dia 8h"
+        )
         return "OK"
     
     if text.lower().startswith("agendar "):
         user_input = text[8:].strip()
-        desc = user_input
-        recurrence = None
         
-        if "todo dia" in user_input.lower():
+        # Detecta recorrência
+        recurrence = None
+        if "todo dia" in user_input.lower() or "diariamente" in user_input.lower():
             recurrence = "daily"
-            desc = user_input.lower().replace("todo dia", "").strip()
+            user_input = re.sub(r'todo dia|diariamente', '', user_input, flags=re.IGNORECASE)
         elif "toda semana" in user_input.lower():
             recurrence = "weekly"
-            desc = user_input.lower().replace("toda semana", "").strip()
+            user_input = re.sub(r'toda semana', '', user_input, flags=re.IGNORECASE)
         
-        parsed = dateparser.parse(desc, settings={'RELATIVE_BASE': datetime.now(), 'PREFER_DATES_FROM': 'future'})
-        if not parsed:
-            send_message(chat_id, "Não entendi a data. Tente: 'agendar X amanhã 15h'")
+        # Normaliza formato de hora
+        user_input = re.sub(r'(\d{1,2})h', r'\1:00', user_input)
+        # Remove palavras-chave problemáticas
+        user_input = re.sub(r'\bpara\b|\bÀ?s?\b', ' ', user_input, flags=re.IGNORECASE)
+        user_input = re.sub(r'\s+', ' ', user_input).strip()
+        
+        if not user_input:
+            send_message(chat_id, "❌ Formato inválido. Use: 'agendar [descrição] [data/hora]'")
             return "OK"
+        
+        # Tenta parsear com suporte a PT
+        try:
+            parsed = dateparser.parse(
+                user_input,
+                languages=['pt'],
+                settings={
+                    'RELATIVE_BASE': datetime.now(),
+                    'PREFER_DATES_FROM': 'future',
+                    'TIMEZONE': 'America/Sao_Paulo'
+                }
+            )
+        except:
+            parsed = None
+        
+        if not parsed:
+            send_message(chat_id, 
+                f"❌ Não entendi: '{user_input}'\n"
+                "✅ Tente: 'agendar X amanhã 15h'"
+            )
+            return "OK"
+        
+        # Extrai descrição removendo partes reconhecidas como data/hora
+        desc = user_input
+        time_patterns = [
+            r'\d{1,2}:\d{2}',  # Horas
+            r'\d{1,2}/\d{1,2}',  # Datas curtas
+            r'amanhã|hoje|segunda|terça|quarta|quinta|sexta|sábado|domingo'
+        ]
+        for pattern in time_patterns:
+            desc = re.sub(pattern, '', desc, flags=re.IGNORECASE)
+        desc = re.sub(r'\s+', ' ', desc).strip()
         
         save_reminder(desc, parsed, recurrence)
         rec_msg = f" (🔁 {recurrence})" if recurrence else ""
-        send_message(chat_id, f"Lembrete salvo!{rec_msg}\n⏰ {desc}\n📅 {parsed.strftime('%d/%m %H:%M')}")
+        send_message(chat_id, 
+            f"✅ Lembrete salvo!{rec_msg}\n"
+            f"⏰ {desc or 'Lembrete'}\n"
+            f"📅 {parsed.strftime('%d/%m/%Y %H:%M')}"
+        )
         return "OK"
     
     return "OK"
