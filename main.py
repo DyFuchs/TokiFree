@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
@@ -75,13 +76,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# >>>>> REMOVA application.initialize() <<<<<
-# Não é necessário com process_update()
-
 @app_flask.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
     update = Update.de_json(request.get_json(), application.bot)
-    application.process_update(update)  # Processamento síncrono
+    asyncio.run(application.process_update(update))  # Correção aqui
     return jsonify({"ok": True})
 
 @app_flask.route("/send-reminders", methods=["GET"])
