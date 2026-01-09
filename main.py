@@ -48,49 +48,69 @@ def delete_reminder(rid):
     conn.commit()
     conn.close()
 
-def parse_datetime_fallback(text):
-    """Parser manual para formatos comuns em português"""
+def parse_datetime(text):
+    """Parser robusto para datas em português"""
     now = datetime.now()
-    text = text.lower()
+    text_lower = text.lower()
     
-    # Detecta hora no formato HH:MM ou HHh
-    hour_match = re.search(r'(\d{1,2})[:h](\d{2})?', text)
-    hour = minute = 0
+    # Detecta hora primeiro
+    hour = now.hour
+    minute = now.minute
+    hour_match = re.search(r'(\d{1,2})[:h](\d{2})?', text_lower)
     if hour_match:
         hour = int(hour_match.group(1))
         minute = int(hour_match.group(2)) if hour_match.group(2) else 0
-        # Remove a hora do texto para facilitar detecção de data
-        text = re.sub(r'\d{1,2}[:h]\d{0,2}', '', text)
+        # Normaliza hora 24h
+        if hour < 12 and ('pm' in text_lower or 'tarde' in text_lower or 'noite' in text_lower):
+            hour += 12
+        elif hour == 12 and ('am' in text_lower or 'manhã' in text_lower):
+            hour = 0
     
-    # Detecta datas relativas
-    if "amanhã" in text:
-        target_date = now.date() + timedelta(days=1)
-    elif "hoje" in text:
-        target_date = now.date()
-    else:
-        # Tenta detectar data no formato DD/MM
-        date_match = re.search(r'(\d{1,2})[/-](\d{1,2})', text)
-        if date_match:
-            day = int(date_match.group(1))
-            month = int(date_match.group(2))
-            year = now.year
+    # Detecta data
+    target_date = now.date()
+    date_found = False
+    
+    # 1. Data explícita no formato DD/MM ou DD/MM/AAAA
+    date_match = re.search(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', text_lower)
+    if date_match:
+        day = int(date_match.group(1))
+        month = int(date_match.group(2))
+        year = int(date_match.group(3)) if date_match.group(3) else now.year
+        
+        # Ajusta ano se necessário
+        if not date_match.group(3):  # Se não especificou ano
             if month < now.month or (month == now.month and day < now.day):
-                year += 1
-            try:
-                target_date = datetime(year, month, day).date()
-            except:
-                target_date = now.date() + timedelta(days=1)
-        else:
-            # Default para amanhã se não encontrar data
+                year = now.year + 1
+        
+        try:
+            target_date = datetime(year, month, day).date()
+            date_found = True
+        except ValueError:
+            pass
+    
+    # 2. Datas relativas (só se não encontrou data explícita)
+    if not date_found:
+        if "amanhã" in text_lower:
             target_date = now.date() + timedelta(days=1)
+        elif "hoje" in text_lower:
+            target_date = now.date()
+        elif "segunda" in text_lower:
+            # Calcula próxima segunda-feira
+            days_ahead = (7 - now.weekday()) % 7
+            if days_ahead == 0:  # Hoje é segunda
+                days_ahead = 7
+            target_date = now.date() + timedelta(days=days_ahead)
+        # Adicione outras datas relativas conforme necessário
     
     # Combina data e hora
     try:
         remind_time = datetime.combine(target_date, datetime.min.time())
         remind_time = remind_time.replace(hour=hour, minute=minute)
-        # Se a hora já passou hoje, agenda para amanhã
-        if remind_time < now:
+        
+        # Se for hoje e a hora já passou, agenda para amanhã
+        if target_date == now.date() and remind_time < now:
             remind_time += timedelta(days=1)
+            
         return remind_time
     except:
         return None
@@ -107,15 +127,17 @@ def webhook():
     
     if text == "/start":
         send_message(chat_id, 
-            "✅ Funciona com estes formatos:\n"
-            "• agendar Dentista amanhã 15h\n"
-            "• agendar Reunião hoje 14:30\n"
-            "• agendar Remédio todo dia 8h"
+            "✅ Formatos que funcionam:\n"
+            "• agendar Dentista hoje 15h\n"
+            "• agendar Reunião amanhã 14:30\n"
+            "• agendar Remédio 10/01/2026 9h\n"
+            "• agendar X todo dia 8h"
         )
         return "OK"
     
     if text.lower().startswith("agendar "):
-        user_input = text[8:].strip()
+        full_input = text[8:].strip()
+        user_input = full_input
         
         # Detecta recorrência
         recurrence = None
@@ -126,30 +148,40 @@ def webhook():
             recurrence = "weekly"
             user_input = re.sub(r'toda semana', '', user_input, flags=re.IGNORECASE)
         
-        # Limpeza básica
-        user_input_clean = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
-        user_input_clean = re.sub(r'\s+', ' ', user_input_clean).strip()
+        # Limpeza para parsing
+        clean_input = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
+        clean_input = re.sub(r'\s+', ' ', clean_input).strip()
         
-        # Primeiro tenta com parser manual (mais confiável para este caso)
-        parsed = parse_datetime_fallback(user_input_clean)
+        # Faz parsing da data/hora
+        parsed = parse_datetime(clean_input)
         
         if not parsed:
             send_message(chat_id, 
-                f"❌ Não entendi a data em: '{user_input}'\n"
-                "✅ Use exatamente: 'agendar [descrição] amanhã 15h'"
+                f"❌ Não consegui agendar: '{full_input}'\n"
+                "✅ Use um destes formatos:\n"
+                "• hoje 15h\n"
+                "• amanhã 14:30\n"
+                "• 10/01/2026 9h"
             )
             return "OK"
         
-        # Extrai descrição removendo palavras-chave de data/hora
-        desc = user_input
-        for kw in ["amanhã", "hoje", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo", 
-                  "todo dia", "diariamente", "toda semana", "para", "às", "as", "h"]:
-            desc = re.sub(rf'\b{kw}\b', '', desc, flags=re.IGNORECASE)
-        # Remove horários e datas
-        desc = re.sub(r'\d{1,2}[:h]\d{0,2}', '', desc)
-        desc = re.sub(r'\d{1,2}[/-]\d{1,2}', '', desc)
-        desc = re.sub(r'\s+', ' ', desc).strip()
+        # Extrai descrição (remove apenas a parte de data/hora detectada)
+        desc = full_input
         
+        # Remove padrões de data/hora específicos que foram detectados
+        patterns_to_remove = [
+            r'\bhoje\b', r'\bamanhã\b',
+            r'\bsegunda\b', r'\bterça\b', r'\bquarta\b', r'\bquinta\b', r'\bsexta\b', r'\bsábado\b', r'\bdomingo\b',
+            r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{4})?\b',  # DD/MM ou DD/MM/AAAA
+            r'\b\d{1,2}[:h]\d{0,2}\b',  # 15h ou 15:30
+            r'\btodo dia\b', r'\bdiariamente\b', r'\btoda semana\b',
+            r'\bpara\b', r'\bàs?\b'
+        ]
+        
+        for pattern in patterns_to_remove:
+            desc = re.sub(pattern, '', desc, flags=re.IGNORECASE)
+        
+        desc = re.sub(r'\s+', ' ', desc).strip()
         if not desc:
             desc = "Lembrete"
         
