@@ -12,8 +12,41 @@ WEBHOOK_PATH = "/webhook"
 CHAT_ID = int(os.getenv("CHAT_ID"))
 
 app_flask = Flask(__name__)
-application = Application.builder().token(BOT_TOKEN).build()
 
+# Inicializa e prepara o Application globalmente
+async def init_application():
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Use: agendar [descrição] [data/hora]")
+    
+    async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        if not text.lower().startswith("agendar "):
+            return
+        user_input = text[8:].strip()
+        desc = user_input
+        recurrence = None
+        if "todo dia" in user_input.lower():
+            recurrence = "daily"
+            desc = user_input.lower().replace("todo dia", "").strip()
+        elif "toda semana" in user_input.lower():
+            recurrence = "weekly"
+            desc = user_input.lower().replace("toda semana", "").strip()
+        parsed = dateparser.parse(desc, settings={'RELATIVE_BASE': datetime.now(), 'PREFER_DATES_FROM': 'future'})
+        if not parsed:
+            await update.message.reply_text("Não entendi a data.")
+            return
+        save_reminder(desc, parsed, recurrence)
+        rec_msg = f" (🔁 {recurrence})" if recurrence else ""
+        await update.message.reply_text(f"Lembrete salvo!{rec_msg}\n⏰ {desc}\n📅 {parsed.strftime('%d/%m %H:%M')}")
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    await application.initialize()
+    return application
+
+# Funções do banco (fora da função assíncrona)
 def init_db():
     conn = sqlite3.connect("reminders.db")
     conn.execute("""
@@ -48,38 +81,13 @@ def delete_reminder(rid):
     conn.commit()
     conn.close()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use: agendar [descrição] [data/hora]")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.lower().startswith("agendar "):
-        return
-    user_input = text[8:].strip()
-    desc = user_input
-    recurrence = None
-    if "todo dia" in user_input.lower():
-        recurrence = "daily"
-        desc = user_input.lower().replace("todo dia", "").strip()
-    elif "toda semana" in user_input.lower():
-        recurrence = "weekly"
-        desc = user_input.lower().replace("toda semana", "").strip()
-    parsed = dateparser.parse(desc, settings={'RELATIVE_BASE': datetime.now(), 'PREFER_DATES_FROM': 'future'})
-    if not parsed:
-        await update.message.reply_text("Não entendi a data.")
-        return
-    save_reminder(desc, parsed, recurrence)
-    rec_msg = f" (🔁 {recurrence})" if recurrence else ""
-    await update.message.reply_text(f"Lembrete salvo!{rec_msg}\n⏰ {desc}\n📅 {parsed.strftime('%d/%m %H:%M')}")
-
-# Registrar handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# Inicializa o Application globalmente
+application = asyncio.run(init_application())
 
 @app_flask.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
     update = Update.de_json(request.get_json(), application.bot)
-    asyncio.run(application.process_update(update))  # Correção aqui
+    asyncio.run(application.process_update(update))
     return jsonify({"ok": True})
 
 @app_flask.route("/send-reminders", methods=["GET"])
