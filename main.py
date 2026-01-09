@@ -10,12 +10,11 @@ import dateparser
 # Configurações
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Ex: https://seu-app.up.railway.app/webhook
 CHAT_ID = int(os.getenv("CHAT_ID"))
 
 app_flask = Flask(__name__)
 
-# Inicializa Telegram Application (sem rodar ainda)
+# Inicializa Telegram Application
 application = Application.builder().token(BOT_TOKEN).build()
 
 # --- Funções do banco ---
@@ -91,14 +90,14 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 # --- Rotas Flask ---
 @app_flask.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-    json_str = request.get_data().decode("utf-8")
-    update = Update.de_json(json_str, application.bot)
+    # Correção principal: usar request.get_json() diretamente
+    update = Update.de_json(request.get_json(), application.bot)
     application.update_queue.put_nowait(update)
     return jsonify({"ok": True})
 
 @app_flask.route("/send-reminders", methods=["GET"])
 def send_reminders_manual():
-    """Endpoint para ser chamado por um cron externo (ex: cron-job.org)"""
+    """Endpoint para ser chamado por cron-job.org"""
     bot = Bot(token=BOT_TOKEN)
     now = datetime.now()
     for r in load_reminders():
@@ -113,11 +112,13 @@ def send_reminders_manual():
 
 @app_flask.route("/")
 def home():
-    # Define webhook no Telegram na primeira visita
+    # Registra o webhook no Telegram
     import requests
-    res = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook", json={"url": WEBHOOK_URL})
+    webhook_url = f"https://{request.host}{WEBHOOK_PATH}"
+    res = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook", json={"url": webhook_url})
     return f"Webhook status: {res.json()}"
 
 if __name__ == "__main__":
     init_db()
-    app_flask.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    app_flask.run(host="0.0.0.0", port=port)
