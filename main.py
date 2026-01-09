@@ -48,7 +48,7 @@ def delete_reminder(rid):
     conn.commit()
     conn.close()
 
-def parse_datetime(text):
+def parse_datetime(text, is_explicit_date=False):
     """Parser robusto para datas em português"""
     now = datetime.now()
     text_lower = text.lower()
@@ -69,6 +69,7 @@ def parse_datetime(text):
     # Detecta data
     target_date = now.date()
     date_found = False
+    is_relative = False  # Flag para datas relativas (hoje/amanhã)
     
     # 1. Data explícita no formato DD/MM ou DD/MM/AAAA
     date_match = re.search(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', text_lower)
@@ -77,14 +78,10 @@ def parse_datetime(text):
         month = int(date_match.group(2))
         year = int(date_match.group(3)) if date_match.group(3) else now.year
         
-        # Ajusta ano se necessário
-        if not date_match.group(3):  # Se não especificou ano
-            if month < now.month or (month == now.month and day < now.day):
-                year = now.year + 1
-        
         try:
             target_date = datetime(year, month, day).date()
             date_found = True
+            is_explicit_date = True  # Marca como data explícita
         except ValueError:
             pass
     
@@ -92,23 +89,24 @@ def parse_datetime(text):
     if not date_found:
         if "amanhã" in text_lower:
             target_date = now.date() + timedelta(days=1)
+            is_relative = True
         elif "hoje" in text_lower:
             target_date = now.date()
+            is_relative = True
         elif "segunda" in text_lower:
-            # Calcula próxima segunda-feira
             days_ahead = (7 - now.weekday()) % 7
-            if days_ahead == 0:  # Hoje é segunda
+            if days_ahead == 0:
                 days_ahead = 7
             target_date = now.date() + timedelta(days=days_ahead)
-        # Adicione outras datas relativas conforme necessário
+            is_relative = True
     
     # Combina data e hora
     try:
         remind_time = datetime.combine(target_date, datetime.min.time())
         remind_time = remind_time.replace(hour=hour, minute=minute)
         
-        # Se for hoje e a hora já passou, agenda para amanhã
-        if target_date == now.date() and remind_time < now:
+        # Só ajusta para amanhã se for data RELATIVA e a hora já passou
+        if is_relative and remind_time < now:
             remind_time += timedelta(days=1)
             
         return remind_time
@@ -127,10 +125,10 @@ def webhook():
     
     if text == "/start":
         send_message(chat_id, 
-            "✅ Formatos que funcionam:\n"
+            "✅ Formatos corrigidos:\n"
             "• agendar Dentista hoje 15h\n"
             "• agendar Reunião amanhã 14:30\n"
-            "• agendar Remédio 10/01/2026 9h\n"
+            "• agendar Remédio 09/01/2026 11:55\n"
             "• agendar X todo dia 8h"
         )
         return "OK"
@@ -148,12 +146,15 @@ def webhook():
             recurrence = "weekly"
             user_input = re.sub(r'toda semana', '', user_input, flags=re.IGNORECASE)
         
+        # Verifica se tem data explícita no formato DD/MM
+        has_explicit_date = bool(re.search(r'\d{1,2}[/-]\d{1,2}', user_input))
+        
         # Limpeza para parsing
         clean_input = re.sub(r'\bpara\b', ' ', user_input, flags=re.IGNORECASE)
         clean_input = re.sub(r'\s+', ' ', clean_input).strip()
         
-        # Faz parsing da data/hora
-        parsed = parse_datetime(clean_input)
+        # Faz parsing da data/hora (passando se é data explícita)
+        parsed = parse_datetime(clean_input, has_explicit_date)
         
         if not parsed:
             send_message(chat_id, 
@@ -161,21 +162,21 @@ def webhook():
                 "✅ Use um destes formatos:\n"
                 "• hoje 15h\n"
                 "• amanhã 14:30\n"
-                "• 10/01/2026 9h"
+                "• 09/01/2026 11:55"
             )
             return "OK"
         
-        # Extrai descrição (remove apenas a parte de data/hora detectada)
+        # Extrai descrição
         desc = full_input
         
-        # Remove padrões de data/hora específicos que foram detectados
+        # Remove padrões de data/hora específicos
         patterns_to_remove = [
             r'\bhoje\b', r'\bamanhã\b',
             r'\bsegunda\b', r'\bterça\b', r'\bquarta\b', r'\bquinta\b', r'\bsexta\b', r'\bsábado\b', r'\bdomingo\b',
-            r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{4})?\b',  # DD/MM ou DD/MM/AAAA
-            r'\b\d{1,2}[:h]\d{0,2}\b',  # 15h ou 15:30
+            r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{4})?\b',
+            r'\b\d{1,2}[:h]\d{0,2}\b',
             r'\btodo dia\b', r'\bdiariamente\b', r'\btoda semana\b',
-            r'\bpara\b', r'\bàs?\b'
+            r'\bpara\b', r'\bàs?\b', r'\bdas\b', r'\bde\b'
         ]
         
         for pattern in patterns_to_remove:
