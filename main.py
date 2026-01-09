@@ -87,17 +87,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+# >>>>> INICIALIZAÇÃO OBRIGATÓRIA <<<<<
+application.initialize()
+
 # --- Rotas Flask ---
 @app_flask.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
-    # Correção principal: usar request.get_json() diretamente
     update = Update.de_json(request.get_json(), application.bot)
     application.update_queue.put_nowait(update)
     return jsonify({"ok": True})
 
 @app_flask.route("/send-reminders", methods=["GET"])
 def send_reminders_manual():
-    """Endpoint para ser chamado por cron-job.org"""
     bot = Bot(token=BOT_TOKEN)
     now = datetime.now()
     for r in load_reminders():
@@ -112,7 +113,6 @@ def send_reminders_manual():
 
 @app_flask.route("/")
 def home():
-    # Registra o webhook no Telegram
     import requests
     webhook_url = f"https://{request.host}{WEBHOOK_PATH}"
     res = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook", json={"url": webhook_url})
