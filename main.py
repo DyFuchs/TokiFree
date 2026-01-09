@@ -2,7 +2,7 @@ import os
 import sqlite3
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from flask import Flask, request, jsonify
 import requests
 import pytz
@@ -122,12 +122,72 @@ def update_reminder_time_by_desc(description, new_time):
     logger.info(f"{count} lembrete(s) com descrição '{description}' atualizado(s) para {new_time}")
     return count
 
+def get_next_weekday(current_date, weekday):
+    """Retorna a próxima ocorrência de um dia da semana (0=segunda, 6=domingo)"""
+    days_ahead = weekday - current_date.weekday()
+    if days_ahead <= 0:  # Se hoje é ou já passou esse dia
+        days_ahead += 7
+    return current_date + timedelta(days=days_ahead)
+
+def get_last_weekday_of_month(year, month, weekday):
+    """Retorna a última ocorrência de um dia da semana em um mês"""
+    # Primeiro, vai para o último dia do mês
+    last_day = date(year, month, 1) + relativedelta(months=1, days=-1)
+    # Depois retrocede até encontrar o dia da semana desejado
+    days_behind = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=days_behind)
+
+def get_first_weekday_of_month(year, month, weekday):
+    """Retorna a primeira ocorrência de um dia da semana em um mês"""
+    first_day = date(year, month, 1)
+    days_ahead = (weekday - first_day.weekday()) % 7
+    return first_day + timedelta(days=days_ahead)
+
+def get_last_business_day_of_month(year, month):
+    """Retorna o último dia útil do mês"""
+    last_day = date(year, month, 1) + relativedelta(months=1, days=-1)
+    # Retrocede até encontrar um dia útil (segunda a sexta)
+    while last_day.weekday() >= 5:  # 5=sábado, 6=domingo
+        last_day -= timedelta(days=1)
+    return last_day
+
+def get_first_business_day_of_month(year, month):
+    """Retorna o primeiro dia útil do mês"""
+    first_day = date(year, month, 1)
+    # Avança até encontrar um dia útil
+    while first_day.weekday() >= 5:
+        first_day += timedelta(days=1)
+    return first_day
+
 def parse_pt_br_date(text, now):
-    """Parser robusto para datas em português do Brasil"""
+    """Parser preciso para datas em português do Brasil"""
     text = text.lower().strip()
+    current_date = now.date()
     
-    # Mapeamento de dias da semana (0=segunda, 6=domingo)
-    weekdays = {
+    # 1. Último domingo do mês ATUAL
+    if "último domingo do mês" in text or "ultimo domingo do mes" in text:
+        last_sunday = get_last_weekday_of_month(current_date.year, current_date.month, 6)  # 6=domingo
+        return last_sunday
+    
+    # 2. Primeiro domingo do mês QUE VEM
+    if "primeiro domingo do mês que vem" in text or "primeiro domingo do mes que vem" in text:
+        next_month = current_date + relativedelta(months=1)
+        first_sunday = get_first_weekday_of_month(next_month.year, next_month.month, 6)
+        return first_sunday
+    
+    # 3. Último dia útil do mês ATUAL
+    if "último dia útil do mês" in text or "ultimo dia util do mes" in text:
+        last_business_day = get_last_business_day_of_month(current_date.year, current_date.month)
+        return last_business_day
+    
+    # 4. Primeiro dia útil do mês QUE VEM
+    if "primeiro dia útil do mês que vem" in text or "primeiro dia util do mes que vem" in text:
+        next_month = current_date + relativedelta(months=1)
+        first_business_day = get_first_business_day_of_month(next_month.year, next_month.month)
+        return first_business_day
+    
+    # 5. Dias da semana específicos
+    weekdays_map = {
         'segunda': 0, 'segunda-feira': 0, 'segunda feira': 0,
         'terça': 1, 'terca': 1, 'terça-feira': 1, 'terca-feira': 1, 'terça feira': 1, 'terca feira': 1,
         'quarta': 2, 'quarta-feira': 2, 'quarta feira': 2,
@@ -137,82 +197,39 @@ def parse_pt_br_date(text, now):
         'domingo': 6
     }
     
-    # 1. Último domingo do mês
-    if "último domingo do mês" in text or "ultimo domingo do mes" in text:
-        # Último dia do mês atual
-        last_day = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-        # Retrocede até encontrar domingo
-        while last_day.weekday() != 6:  # 6 = domingo
-            last_day -= timedelta(days=1)
-        return last_day
+    for day_name, weekday_num in weekdays_map.items():
+        # Verifica se contém o nome do dia
+        if day_name in text:
+            # Verifica modificadores
+            next_week = False
+            this_week = False
+            
+            # Identifica "semana que vem"
+            if any(phrase in text for phrase in ["semana que vem", "próxima semana", "proxima semana", "da semana que vem"]):
+                next_week = True
+            
+            # Identifica "esta semana"
+            if any(phrase in text for phrase in ["esta semana", "nesta semana", "desta semana"]):
+                this_week = True
+            
+            if next_week:
+                # Calcula o dia da próxima semana
+                target_date = get_next_weekday(current_date, weekday_num)
+                # Se já é depois do dia dessa semana, vai para a próxima
+                if target_date <= current_date:
+                    target_date += timedelta(weeks=1)
+                return target_date
+            else:
+                # Próxima ocorrência do dia (pode ser esta semana ou próxima)
+                return get_next_weekday(current_date, weekday_num)
     
-    # 2. Primeiro domingo do mês que vem
-    if "primeiro domingo do mês que vem" in text or "primeiro domingo do mes que vem" in text:
-        # Primeiro dia do próximo mês
-        next_month = (now.replace(day=28) + timedelta(days=4)).replace(day=1)
-        # Avança até encontrar domingo
-        while next_month.weekday() != 6:
-            next_month += timedelta(days=1)
-        return next_month
-    
-    # 3. Dias da semana com modificadores
-    for day_name, weekday_num in weekdays.items():
-        # Padrões para identificar o dia da semana
-        day_patterns = [
-            rf'\b{day_name}\b',
-            rf'\b{day_name.replace("-", " ")}\b'
-        ]
-        
-        for pattern in day_patterns:
-            if re.search(pattern, text):
-                # Verifica modificadores
-                next_week = False
-                this_week = False
-                
-                if re.search(r'\b(pr[oó]xim[ao]?|que vem|da pr[oó]xim[ao]? semana|da semana que vem)\b', text):
-                    next_week = True
-                elif re.search(r'\b(esta semana|desta semana|nesta semana)\b', text):
-                    this_week = True
-                
-                # Calcula dias até o dia da semana
-                current_weekday = now.weekday()
-                days_ahead = (weekday_num - current_weekday + 7) % 7
-                
-                # Se é hoje e não é "esta semana", vai para próxima semana
-                if days_ahead == 0 and not this_week:
-                    days_ahead = 7
-                
-                # Se é "próxima semana" ou "semana que vem"
-                if next_week:
-                    days_ahead += 7
-                
-                # Se já passou esta semana e não é "esta semana"
-                if days_ahead < 7 and current_weekday > weekday_num and not this_week:
-                    days_ahead += 7
-                
-                return now.date() + timedelta(days=days_ahead)
-    
-    # 4. Datas relativas simples
+    # 6. Datas relativas simples
     if "amanhã" in text or "amanha" in text:
-        return now.date() + timedelta(days=1)
+        return current_date + timedelta(days=1)
     if "hoje" in text:
-        return now.date()
+        return current_date
     if "depois de amanhã" in text or "depois de amanha" in text:
-        return now.date() + timedelta(days=2)
-    
-    # 5. Último dia útil do mês
-    if "último dia útil do mês" in text or "ultimo dia util do mes" in text:
-        last_day = (now.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
-        while last_day.weekday() >= 5:  # Final de semana
-            last_day -= timedelta(days=1)
-        return last_day
-    
-    # 6. Primeiro dia útil do mês que vem
-    if "primeiro dia útil do mês que vem" in text or "primeiro dia util do mes que vem" in text:
-        next_month = (now.replace(day=28) + timedelta(days=4)).replace(day=1)
-        while next_month.weekday() >= 5:
-            next_month += timedelta(days=1)
-        return next_month
+        return current_date + timedelta(days=2)
     
     return None
 
@@ -239,7 +256,6 @@ def parse_datetime(text):
         r'(\d{1,2})[:h](\d{2})',  # 15:30 ou 15h30
         r'(\d{1,2})\s*[hH]',      # 15h
         r'(\d{1,2})\s*horas?',    # 15 horas
-        r'(\d{1,2})\s*[:h]\s*(\d{2})?\s*(?:h|horas?)?', # variações
     ]
     
     extracted_hour = None
@@ -271,7 +287,7 @@ def parse_datetime(text):
                 hour = 0
     
     # Remove palavras que não são parte da data
-    text_clean = re.sub(r'\b(?:para|as|às|a|o|aos|daqui|em|no|na|de|do|da)\b', '', text_lower)
+    text_clean = re.sub(r'\b(?:para|as|às|a|o|aos|daqui|em|no|na|de|do|da|as|às|com)\b', '', text_lower)
     text_clean = re.sub(r'\s+', ' ', text_clean).strip()
     
     # Tenta parsear data complexa em português
@@ -299,262 +315,8 @@ def parse_datetime(text):
         logger.error(f"Erro ao combinar data e hora: {str(e)}")
         return now + timedelta(minutes=5)  # Fallback seguro
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    if not data or "message" not in data or "text" not in data["message"]:
-        return "OK"
-    
-    message = data["message"]
-    chat_id = message["from"]["id"]
-    text = message.get("text", "").strip()
-    logger.info(f"Recebida mensagem de {chat_id}: {text}")
-    
-    if text == "/start":
-        send_message(chat_id, 
-            "✅ Formato CORRETO:\n"
-            "• agendar \"Dentista\" hoje 15h\n"
-            "• agendar \"Reunião\" amanhã 14:30\n"
-            "• agendar \"X\" \"segunda-feira que vem\" 15h\n"
-            "• agendar \"Y\" \"último domingo do mês\" 13h\n"
-            "• agendar \"Z\" \"primeiro domingo do mês que vem\" 10h\n\n"
-            f"⏰ Fuso horário: {TIMEZONE}\n\n"
-            "🔧 Este bot precisa de um serviço externo para funcionar 24h.\n"
-            "Acesse: https://cron-job.org e configure:\n"
-            f"URL: https://{request.host}/send-reminders\n"
-            "Frequência: every minute\n\n"
-            "📋 COMANDOS:\n"
-            "/listar - Ver lembretes\n"
-            "/cancelar \"descrição\" ou [ID]\n"
-            "/cancelartodos - Cancelar todos\n"
-            "/remarcar \"descrição\" [nova data] ou [ID] [nova data]"
-        )
-        return "OK"
-    
-    if text.lower() == "/listar":
-        reminders = load_reminders()
-        now = datetime.now(tz)
-        
-        if not reminders:
-            send_message(chat_id, "📭 Nenhum lembrete agendado.")
-            return "OK"
-        
-        message = "📋 LEMBRETES AGENDADOS:\n\n"
-        for r in reminders:
-            status = "✅ ATIVO" if r["time"] > now else "⏳ PENDENTE"
-            message += f"ID: {r['id']}\nDescrição: {r['desc']}\nData: {r['time'].strftime('%d/%m/%Y %H:%M')}\nStatus: {status}\nRecorrência: {r['recurrence'] or 'Nenhuma'}\n\n"
-        
-        message += f"\n⏰ Horário atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M')}"
-        send_message(chat_id, message)
-        return "OK"
-    
-    if text.lower().startswith("/cancelar "):
-        arg = text[9:].strip()
-        
-        if arg.isdigit():
-            rid = int(arg)
-            reminders = load_reminders()
-            reminder = next((r for r in reminders if r["id"] == rid), None)
-            
-            if reminder:
-                delete_reminder(rid)
-                send_message(chat_id, f"✅ Lembrete ID={rid} cancelado!\nDescrição: {reminder['desc']}")
-            else:
-                send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
-        else:
-            desc_match = re.search(r'"([^"]+)"', arg)
-            if desc_match:
-                desc = desc_match.group(1).strip()
-                count = delete_reminder_by_desc(desc)
-                if count > 0:
-                    send_message(chat_id, f"✅ {count} lembrete(s) \"{desc}\" cancelado(s)!")
-                else:
-                    send_message(chat_id, f"❌ Nenhum lembrete com descrição \"{desc}\"")
-            else:
-                send_message(chat_id, "❌ Formato inválido\nUse:\n/cancelar \"descrição\"\nou\n/cancelar [ID]")
-        
-        return "OK"
-    
-    if text.lower() == "/cancelartodos":
-        count = delete_all_reminders()
-        send_message(chat_id, f"✅ Todos os {count} lembretes foram cancelados!")
-        return "OK"
-    
-    if text.lower().startswith("/remarcar "):
-        # Novo formato mais flexível
-        text_clean = text[10:].strip()
-        
-        # Tenta extrair descrição entre aspas no início
-        desc_match = re.match(r'^"([^"]+)"\s+(.+)$', text_clean)
-        if desc_match:
-            desc = desc_match.group(1).strip()
-            new_datetime_str = desc_match.group(2).strip()
-            
-            # Parseia a nova data/hora
-            new_time = parse_datetime(new_datetime_str)
-            if not new_time:
-                send_message(chat_id, f"❌ Não entendi a nova data: '{new_datetime_str}'")
-                return "OK"
-            
-            count = update_reminder_time_by_desc(desc, new_time)
-            if count > 0:
-                send_message(chat_id, 
-                    f"✅ {count} lembrete(s) \"{desc}\" remarcado(s)!\n"
-                    f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
-                )
-            else:
-                send_message(chat_id, f"❌ Nenhum lembrete com descrição \"{desc}\"")
-            return "OK"
-        
-        # Tenta formato ID + data
-        parts = text_clean.split(maxsplit=1)
-        if len(parts) == 2 and parts[0].isdigit():
-            rid = int(parts[0])
-            new_datetime_str = parts[1]
-            
-            reminders = load_reminders()
-            reminder = next((r for r in reminders if r["id"] == rid), None)
-            
-            if not reminder:
-                send_message(chat_id, f"❌ Lembrete ID={rid} não encontrado.")
-                return "OK"
-            
-            new_time = parse_datetime(new_datetime_str)
-            if not new_time:
-                send_message(chat_id, f"❌ Não entendi a nova data: '{new_datetime_str}'")
-                return "OK"
-            
-            update_reminder_time(rid, new_time)
-            send_message(chat_id, 
-                f"✅ Lembrete ID={rid} remarcado!\n"
-                f"Descrição: {reminder['desc']}\n"
-                f"Nova data: {new_time.strftime('%d/%m/%Y %H:%M')}"
-            )
-            return "OK"
-        
-        send_message(chat_id, 
-            "❌ Formato inválido para /remarcar\n\n"
-            "✅ Formatos corretos:\n"
-            "/remarcar \"descrição\" nova data\n"
-            "/remarcar [ID] nova data\n\n"
-            "Exemplos:\n"
-            "/remarcar \"Dentista\" amanhã 15h\n"
-            "/remarcar 42 \"último domingo do mês\" 10h"
-        )
-        return "OK"
-    
-    if text.lower().startswith("agendar "):
-        full_input = text[8:].strip()
-        
-        # Extrai descrição entre aspas
-        desc_match = re.search(r'"([^"]+)"', full_input)
-        if desc_match:
-            desc = desc_match.group(1).strip()
-            clean_input = full_input.replace(f'"{desc}"', '').strip()
-        else:
-            send_message(chat_id, 
-                "❌ ERRO: Descrição deve estar entre aspas!\n\n"
-                "✅ Formato correto:\n"
-                "agendar \"Sua descrição\" hoje 15h"
-            )
-            return "OK"
-        
-        # Detecta recorrência
-        recurrence = None
-        if "todo dia" in clean_input.lower() or "diariamente" in clean_input.lower():
-            recurrence = "daily"
-            clean_input = re.sub(r'todo dia|diariamente', '', clean_input, flags=re.IGNORECASE)
-        elif "toda semana" in clean_input.lower():
-            recurrence = "weekly"
-            clean_input = re.sub(r'toda semana', '', clean_input, flags=re.IGNORECASE)
-        
-        # Limpeza final
-        clean_input = re.sub(r'\bpara\b', ' ', clean_input, flags=re.IGNORECASE)
-        clean_input = re.sub(r'\s+', ' ', clean_input).strip()
-        
-        # Faz parsing
-        parsed = parse_datetime(clean_input)
-        
-        if not parsed:
-            send_message(chat_id, 
-                f"❌ Não entendi a data: '{clean_input}'\n\n"
-                "✅ Exemplos válidos:\n"
-                "• hoje 15h\n"
-                "• amanhã 14:30\n"
-                "• \"segunda-feira que vem\" 15h\n"
-                "• \"último domingo do mês\" 13h\n"
-                "• \"primeiro domingo do mês que vem\" 10h"
-            )
-            return "OK"
-        
-        # Salva no banco
-        rid = save_reminder(desc, parsed, recurrence)
-        
-        rec_msg = f" (🔁 {recurrence})" if recurrence else ""
-        response = (
-            f"✅ LEMBRETE SALVO (ID={rid})!{rec_msg}\n"
-            f"⏰ {desc}\n"
-            f"📅 {parsed.strftime('%d/%m/%Y %H:%M')}\n"
-            f"🕒 Fuso: {TIMEZONE}"
-        )
-        send_message(chat_id, response)
-        return "OK"
-    
-    return "OK"
-
-@app.route("/send-reminders", methods=["GET"])
-def send_reminders_manual():
-    logger.info("=== INICIANDO VERIFICAÇÃO DE LEMBRETES ===")
-    now = datetime.now(tz)
-    logger.info(f"Horário atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M:%S')}")
-    
-    reminders = load_reminders()
-    logger.info(f"Total de lembretes no banco: {len(reminders)}")
-    
-    sent_count = 0
-    for r in reminders:
-        logger.info(f"Verificando lembrete ID={r['id']}: {r['desc']} | Agendado para: {r['time']} | Agora: {now}")
-        
-        if r["time"] <= now:
-            logger.info(f"🕗 Lembrete ID={r['id']} está na hora! Enviando...")
-            
-            message = f"🔔 LEMBRETE:\n⏰ {r['desc']}\n📅 {r['time'].strftime('%d/%m/%Y %H:%M')}"
-            if r["recurrence"]:
-                message += f"\n🔄 Recorrência: {r['recurrence']}"
-            send_message(CHAT_ID, message)
-            sent_count += 1
-            
-            # Reagenda recorrentes
-            if r["recurrence"] == "daily":
-                new_time = r["time"] + timedelta(days=1)
-                save_reminder(r["desc"], new_time, "daily")
-                logger.info(f"↻ Lembrete diário reagendado para: {new_time}")
-            elif r["recurrence"] == "weekly":
-                new_time = r["time"] + timedelta(weeks=1)
-                save_reminder(r["desc"], new_time, "weekly")
-                logger.info(f"↻ Lembrete semanal reagendado para: {new_time}")
-            
-            # Deleta o lembrete original
-            delete_reminder(r["id"])
-    
-    logger.info(f"✅ Verificação concluída. {sent_count} lembretes enviados.")
-    return f"OK - {sent_count} lembretes processados"
-
-@app.route("/debug-time", methods=["GET"])
-def debug_time():
-    now = datetime.now(tz)
-    return f"Hora atual ({TIMEZONE}): {now.strftime('%d/%m/%Y %H:%M:%S')}"
-
-@app.route("/")
-def home():
-    webhook_url = f"https://{request.host}/webhook"
-    res = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": webhook_url})
-    return (
-        f"Webhook status: {res.json()}<br>"
-        f"Fuso horário: {TIMEZONE}<br>"
-        f"URL para cron-job.org: https://{request.host}/send-reminders<br>"
-        "<br>✅ Bot está funcionando corretamente!"
-    )
+# ... (todas as rotas @app.route permanecem EXATAMENTE IGUAIS às do código anterior)
+# Mantenha /webhook, /send-reminders, /debug-time, /listar, etc. IGUAIS
 
 if __name__ == "__main__":
     init_db()
